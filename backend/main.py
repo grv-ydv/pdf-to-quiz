@@ -2,9 +2,12 @@
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
+import json
+import hashlib
 import logging
 import traceback
 
@@ -29,6 +32,9 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 from services.pdf_parser import extract_text_from_pdf_url, extract_text_from_file, extract_answer_key_basic
 from services.ai_structurer import structure_questions_with_ai, parse_answer_key_with_ai
 from services.grader import grade_attempt
+
+# ─── In-memory cache for parsed PDFs (keyed by text hash) ───
+_pdf_cache: dict[str, list[dict]] = {}
 
 # ─── App Setup ───
 
@@ -132,13 +138,19 @@ async def parse_pdf_upload(file: UploadFile = File(...), quiz_id: str = Form(...
         if not raw_text.strip():
             raise HTTPException(status_code=400, detail="Could not extract text from PDF. The PDF might be image-based.")
         
-        # 2. Structure with Gemini Flash
-        logger.info("Sending to Gemini for structuring...")
-        questions = structure_questions_with_ai(raw_text)
-        logger.info(f"Gemini returned {len(questions)} questions")
-        if not questions:
-            raise HTTPException(status_code=400, detail="AI could not parse questions from the text")
-        
+        # 2. Check cache or structure with AI
+        text_hash = hashlib.sha256(raw_text.encode()).hexdigest()
+        if text_hash in _pdf_cache:
+            questions = _pdf_cache[text_hash]
+            logger.info(f"Cache hit! Reusing {len(questions)} cached questions")
+        else:
+            logger.info("Sending to AI for structuring...")
+            questions = structure_questions_with_ai(raw_text)
+            if not questions:
+                raise HTTPException(status_code=400, detail="AI could not parse questions from the text")
+            _pdf_cache[text_hash] = questions
+            logger.info(f"AI returned {len(questions)} questions (cached)")
+
         # 3. Save to Supabase (questions table)
         rows = []
         for q in questions:
@@ -149,16 +161,16 @@ async def parse_pdf_upload(file: UploadFile = File(...), quiz_id: str = Form(...
                 "options": q["options"],
                 "correct_option": None,
             })
-        
+
         result = supabase.table("questions").insert(rows).execute()
         logger.info(f"Inserted {len(rows)} questions into Supabase")
-        
+
         # 4. Update quiz status and total questions
         supabase.table("quizzes").update({
             "status": "review",
             "total_questions": len(questions),
         }).eq("id", quiz_id).execute()
-        
+
         return {
             "success": True,
             "total_questions": len(questions),
@@ -169,6 +181,70 @@ async def parse_pdf_upload(file: UploadFile = File(...), quiz_id: str = Form(...
     except Exception as e:
         logger.error(f"parse_pdf_upload error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"PDF parsing failed: {str(e)}")
+
+
+@app.post("/api/parse-pdf-upload-stream")
+async def parse_pdf_upload_stream(file: UploadFile = File(...), quiz_id: str = Form(...)):
+    """
+    Same as parse-pdf-upload but streams progress events via SSE.
+    """
+    async def event_stream():
+        try:
+            def send_event(stage: str, message: str, **extra):
+                data = {"stage": stage, "message": message, **extra}
+                return f"data: {json.dumps(data)}\n\n"
+
+            yield send_event("uploading", "Reading uploaded file...")
+            file_bytes = await file.read()
+
+            yield send_event("extracting", "Extracting text from PDF...")
+            raw_text = extract_text_from_file(file_bytes)
+            if not raw_text.strip():
+                yield send_event("error", "Could not extract text from PDF. The PDF might be image-based.")
+                return
+
+            char_count = len(raw_text)
+            text_hash = hashlib.sha256(raw_text.encode()).hexdigest()
+
+            if text_hash in _pdf_cache:
+                questions = _pdf_cache[text_hash]
+                yield send_event("ai_processing", f"Found cached results for this PDF! ({len(questions)} questions)")
+            else:
+                yield send_event("ai_processing", f"Structuring questions with AI... ({char_count} chars extracted)")
+                questions = structure_questions_with_ai(raw_text)
+                if questions:
+                    _pdf_cache[text_hash] = questions
+
+            if not questions:
+                yield send_event("error", "AI could not parse questions from the text")
+                return
+
+            yield send_event("saving", f"Saving {len(questions)} questions to database...")
+
+            rows = []
+            for q in questions:
+                rows.append({
+                    "quiz_id": quiz_id,
+                    "question_number": q["question_number"],
+                    "question_text": q["question_text"],
+                    "options": q["options"],
+                    "correct_option": None,
+                })
+
+            supabase.table("questions").insert(rows).execute()
+
+            supabase.table("quizzes").update({
+                "status": "review",
+                "total_questions": len(questions),
+            }).eq("id", quiz_id).execute()
+
+            yield send_event("complete", "Quiz ready!", total_questions=len(questions))
+
+        except Exception as e:
+            logger.error(f"parse_pdf_upload_stream error: {traceback.format_exc()}")
+            yield f"data: {json.dumps({'stage': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.post("/api/parse-answer-key-upload")
@@ -203,24 +279,30 @@ async def parse_answer_key_upload(file: UploadFile = File(...), quiz_id: str = F
         if not answer_map:
             raise HTTPException(status_code=400, detail="Could not parse answer key from PDF")
         
-        # 3. Update questions in Supabase
+        # 3. Update questions in Supabase (batch by correct_option value)
         result = supabase.table("questions") \
             .select("id, question_number") \
             .eq("quiz_id", quiz_id) \
             .execute()
-        
-        updated_count = 0
+
+        # Group question IDs by their correct option to minimize HTTP calls
+        option_groups: dict[str, list[str]] = {}
         for q_row in result.data:
             q_num = str(q_row["question_number"])
             if q_num in answer_map:
-                supabase.table("questions") \
-                    .update({"correct_option": answer_map[q_num]}) \
-                    .eq("id", q_row["id"]) \
-                    .execute()
-                updated_count += 1
-        
-        logger.info(f"Updated {updated_count} questions with answers")
-        
+                opt = answer_map[q_num]
+                option_groups.setdefault(opt, []).append(q_row["id"])
+
+        updated_count = 0
+        for opt_value, q_ids in option_groups.items():
+            supabase.table("questions") \
+                .update({"correct_option": opt_value}) \
+                .in_("id", q_ids) \
+                .execute()
+            updated_count += len(q_ids)
+
+        logger.info(f"Updated {updated_count} questions with answers in {len(option_groups)} batch(es)")
+
         return {
             "success": True,
             "total_answers": len(answer_map),
@@ -260,22 +342,27 @@ async def parse_answer_key(request: ParseAnswerKeyRequest):
         if not answer_map:
             raise HTTPException(status_code=400, detail="Could not parse answer key from PDF")
         
-        # 3. Update questions in Supabase
+        # 3. Update questions in Supabase (batch by correct_option value)
         result = supabase.table("questions") \
             .select("id, question_number") \
             .eq("quiz_id", request.quiz_id) \
             .execute()
-        
-        updated_count = 0
+
+        option_groups: dict[str, list[str]] = {}
         for q_row in result.data:
             q_num = str(q_row["question_number"])
             if q_num in answer_map:
-                supabase.table("questions") \
-                    .update({"correct_option": answer_map[q_num]}) \
-                    .eq("id", q_row["id"]) \
-                    .execute()
-                updated_count += 1
-        
+                opt = answer_map[q_num]
+                option_groups.setdefault(opt, []).append(q_row["id"])
+
+        updated_count = 0
+        for opt_value, q_ids in option_groups.items():
+            supabase.table("questions") \
+                .update({"correct_option": opt_value}) \
+                .in_("id", q_ids) \
+                .execute()
+            updated_count += len(q_ids)
+
         return {
             "success": True,
             "total_answers": len(answer_map),
