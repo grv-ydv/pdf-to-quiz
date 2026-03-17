@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, memo } from 'react';
 import { useRouter, useParams } from 'next/navigation';
 import { useAuth } from '@/contexts/AuthContext';
 import { supabase } from '@/lib/supabase';
@@ -8,6 +8,100 @@ import { Quiz, Question, OptionKey } from '@/types';
 import { Clock, AlertTriangle, ChevronLeft, ChevronRight, Send, Bookmark, SkipForward, Eraser } from 'lucide-react';
 
 type QuestionStatus = 'not-visited' | 'not-answered' | 'answered' | 'review';
+
+// Isolated timer component — only this re-renders every second
+const TimerDisplay = memo(function TimerDisplay({
+    initialSeconds,
+    onExpire,
+    loading,
+    submitted,
+}: {
+    initialSeconds: number;
+    onExpire: () => void;
+    loading: boolean;
+    submitted: boolean;
+}) {
+    const [timeLeft, setTimeLeft] = useState(initialSeconds);
+
+    useEffect(() => {
+        setTimeLeft(initialSeconds);
+    }, [initialSeconds]);
+
+    useEffect(() => {
+        if (timeLeft <= 0 || submitted || loading) return;
+        const interval = setInterval(() => {
+            setTimeLeft(prev => {
+                if (prev <= 1) { onExpire(); return 0; }
+                return prev - 1;
+            });
+        }, 1000);
+        return () => clearInterval(interval);
+    }, [timeLeft, submitted, loading, onExpire]);
+
+    const m = Math.floor(timeLeft / 60);
+    const s = timeLeft % 60;
+    const formatted = `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    const timerClass = timeLeft <= 60 ? 'timer timer-danger' : timeLeft <= 300 ? 'timer timer-warning' : 'timer';
+
+    return (
+        <>
+            <div className={timerClass}>
+                <Clock size={16} />
+                {formatted}
+            </div>
+            {timeLeft > 0 && timeLeft <= 300 && (
+                <div style={{
+                    position: 'fixed', bottom: '90px', left: '50%', transform: 'translateX(-50%)',
+                    background: 'var(--warning-light)', border: '1px solid var(--warning)',
+                    borderRadius: 'var(--radius)', padding: '10px 20px',
+                    display: 'flex', alignItems: 'center', gap: '8px',
+                    fontSize: '13px', fontWeight: 600, color: '#b45309',
+                    boxShadow: 'var(--shadow-lg)', zIndex: 60,
+                }}>
+                    <AlertTriangle size={16} />
+                    {timeLeft <= 60 ? 'Less than 1 minute remaining!' : `${Math.ceil(timeLeft / 60)} minutes remaining`}
+                </div>
+            )}
+        </>
+    );
+});
+
+// Memoized question grid — only re-renders when answers/navigation change
+const QuestionGrid = memo(function QuestionGrid({
+    questions,
+    currentQ,
+    getQuestionStatus,
+    goToQuestion,
+}: {
+    questions: Question[];
+    currentQ: number;
+    getQuestionStatus: (index: number) => QuestionStatus;
+    goToQuestion: (index: number) => void;
+}) {
+    return (
+        <div className="q-grid">
+            {questions.map((q, idx) => {
+                const status = getQuestionStatus(idx);
+                const isCurrent = idx === currentQ;
+                let className = 'q-grid-btn';
+                if (status === 'answered') className += ' q-grid-btn--answered';
+                else if (status === 'not-answered') className += ' q-grid-btn--not-answered';
+                else if (status === 'review') className += ' q-grid-btn--review';
+                if (isCurrent) className += ' q-grid-btn--current';
+                return (
+                    <button
+                        key={idx}
+                        className={className}
+                        onClick={() => goToQuestion(idx)}
+                        title={`Question ${idx + 1} - ${status.replace('-', ' ')}`}
+                    >
+                        {idx + 1}
+                    </button>
+                );
+            })}
+        </div>
+    );
+});
 
 export default function QuizAttemptPage() {
     const { user } = useAuth();
@@ -21,7 +115,7 @@ export default function QuizAttemptPage() {
     const [currentQ, setCurrentQ] = useState(0); // index into questions[]
     const [visited, setVisited] = useState<Set<number>>(new Set([0]));
     const [markedForReview, setMarkedForReview] = useState<Set<number>>(new Set());
-    const [timeLeft, setTimeLeft] = useState(0);
+    const [timerSeconds, setTimerSeconds] = useState(0);
     const [submitted, setSubmitted] = useState(false);
     const [loading, setLoading] = useState(true);
 
@@ -50,7 +144,7 @@ export default function QuizAttemptPage() {
                 createdAt: new Date(quizData.created_at),
             };
             setQuiz(mappedQuiz);
-            setTimeLeft(mappedQuiz.timerMinutes * 60);
+            setTimerSeconds(mappedQuiz.timerMinutes * 60);
 
             const { data: qData } = await supabase
                 .from('questions')
@@ -72,18 +166,6 @@ export default function QuizAttemptPage() {
         }
         load();
     }, [quizId, router]);
-
-    // Countdown timer
-    useEffect(() => {
-        if (timeLeft <= 0 || submitted || loading) return;
-        const interval = setInterval(() => {
-            setTimeLeft(prev => {
-                if (prev <= 1) { handleSubmit(); return 0; }
-                return prev - 1;
-            });
-        }, 1000);
-        return () => clearInterval(interval);
-    }, [timeLeft, submitted, loading]);
 
     const handleSubmit = useCallback(async () => {
         if (submitted || !user || !quiz) return;
@@ -115,11 +197,13 @@ export default function QuizAttemptPage() {
     }, [submitted, user, quiz, quizId, answers, questions, router]);
 
     // ─── Navigation Helpers ───
-    function goToQuestion(index: number) {
-        if (index < 0 || index >= questions.length) return;
-        setCurrentQ(index);
-        setVisited(prev => new Set(prev).add(index));
-    }
+    const goToQuestion = useCallback((index: number) => {
+        setCurrentQ(prev => {
+            if (index < 0 || index >= questions.length) return prev;
+            setVisited(v => new Set(v).add(index));
+            return index;
+        });
+    }, [questions.length]);
 
     function selectAnswer(qNum: number, option: OptionKey) {
         if (submitted) return;
@@ -174,19 +258,13 @@ export default function QuizAttemptPage() {
         });
     }
 
-    function getQuestionStatus(index: number): QuestionStatus {
+    const getQuestionStatus = useCallback((index: number): QuestionStatus => {
         if (markedForReview.has(index)) return 'review';
         const qNum = questions[index]?.questionNumber;
         if (qNum && answers[qNum]) return 'answered';
         if (visited.has(index)) return 'not-answered';
         return 'not-visited';
-    }
-
-    function formatTime(seconds: number) {
-        const m = Math.floor(seconds / 60);
-        const s = seconds % 60;
-        return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-    }
+    }, [markedForReview, questions, answers, visited]);
 
     if (loading) {
         return (
@@ -219,7 +297,6 @@ export default function QuizAttemptPage() {
     const reviewCount = markedForReview.size;
     const notVisitedCount = totalQ - visited.size;
     const options: OptionKey[] = ['A', 'B', 'C', 'D'];
-    const timerClass = timeLeft <= 60 ? 'timer timer-danger' : timeLeft <= 300 ? 'timer timer-warning' : 'timer';
 
     return (
         <div style={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
@@ -231,10 +308,12 @@ export default function QuizAttemptPage() {
                     </h2>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
-                    <div className={timerClass}>
-                        <Clock size={16} />
-                        {formatTime(timeLeft)}
-                    </div>
+                    <TimerDisplay
+                        initialSeconds={timerSeconds}
+                        onExpire={handleSubmit}
+                        loading={loading}
+                        submitted={submitted}
+                    />
                 </div>
             </div>
 
@@ -303,27 +382,12 @@ export default function QuizAttemptPage() {
                     </div>
 
                     {/* Question Grid */}
-                    <div className="q-grid">
-                        {questions.map((q, idx) => {
-                            const status = getQuestionStatus(idx);
-                            const isCurrent = idx === currentQ;
-                            let className = 'q-grid-btn';
-                            if (status === 'answered') className += ' q-grid-btn--answered';
-                            else if (status === 'not-answered') className += ' q-grid-btn--not-answered';
-                            else if (status === 'review') className += ' q-grid-btn--review';
-                            if (isCurrent) className += ' q-grid-btn--current';
-                            return (
-                                <button
-                                    key={idx}
-                                    className={className}
-                                    onClick={() => goToQuestion(idx)}
-                                    title={`Question ${idx + 1} - ${status.replace('-', ' ')}`}
-                                >
-                                    {idx + 1}
-                                </button>
-                            );
-                        })}
-                    </div>
+                    <QuestionGrid
+                        questions={questions}
+                        currentQ={currentQ}
+                        getQuestionStatus={getQuestionStatus}
+                        goToQuestion={goToQuestion}
+                    />
 
                     {/* Submit Button in Nav Panel */}
                     <div style={{ padding: '16px 20px', marginTop: 'auto', borderTop: '1px solid var(--border-light)' }}>
@@ -380,20 +444,6 @@ export default function QuizAttemptPage() {
                 </div>
             </div>
 
-            {/* Time Warning Toast */}
-            {timeLeft > 0 && timeLeft <= 300 && (
-                <div style={{
-                    position: 'fixed', bottom: '90px', left: '50%', transform: 'translateX(-50%)',
-                    background: 'var(--warning-light)', border: '1px solid var(--warning)',
-                    borderRadius: 'var(--radius)', padding: '10px 20px',
-                    display: 'flex', alignItems: 'center', gap: '8px',
-                    fontSize: '13px', fontWeight: 600, color: '#b45309',
-                    boxShadow: 'var(--shadow-lg)', zIndex: 60,
-                }}>
-                    <AlertTriangle size={16} />
-                    {timeLeft <= 60 ? 'Less than 1 minute remaining!' : `${Math.ceil(timeLeft / 60)} minutes remaining`}
-                </div>
-            )}
         </div>
     );
 }

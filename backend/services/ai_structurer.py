@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 KIMI_API_KEY = os.getenv("KIMI_API_KEY", "")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 
 gemini_client = None
 if GEMINI_API_KEY:
@@ -24,6 +25,15 @@ if KIMI_API_KEY:
     kimi_client = OpenAI(
         api_key=KIMI_API_KEY,
         base_url="https://api.moonshot.cn/v1",
+        timeout=30.0,
+    )
+
+deepseek_client = None
+if DEEPSEEK_API_KEY:
+    deepseek_client = OpenAI(
+        api_key=DEEPSEEK_API_KEY,
+        base_url="https://api.deepseek.com",
+        timeout=30.0,
     )
 
 # ─── Prompts ───
@@ -149,24 +159,42 @@ def _call_kimi(prompt: str) -> str:
     return response.choices[0].message.content.strip()
 
 
-def _call_ai_with_fallback(prompt: str) -> str:
-    """Try multiple Gemini models (with thinking disabled), then fall back to Kimi."""
-    # Gemini models to try in order (different models have separate quotas)
-    gemini_models = ["gemini-2.5-flash", "gemini-2.0-flash"]
+def _call_deepseek(prompt: str) -> str:
+    """Call DeepSeek as primary AI. Raises on failure."""
+    if not deepseek_client:
+        raise RuntimeError("DeepSeek API key not configured")
     
+    response = deepseek_client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {"role": "system", "content": "You are a precise JSON-only parser. Return only valid JSON, no markdown, no explanations."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.1,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def _call_ai_with_fallback(prompt: str) -> str:
+    """Try Gemini (fastest) -> DeepSeek -> Kimi."""
+
+    # 1. Gemini (Primary — fastest at 5-15s with native JSON output)
+    gemini_models = ["gemini-2.5-flash", "gemini-2.0-flash"]
+
     if gemini_client:
         for model_name in gemini_models:
             try:
                 logger.info(f"Trying Gemini model: {model_name}...")
-                
+
                 config_dict = {
                     "response_mime_type": "application/json",
                     "temperature": 0.1,
+                    "http_options": {"timeout": 60000},
                 }
                 # Disable thinking for 2.5 models → much faster responses
                 if "2.5" in model_name:
                     config_dict["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-                
+
                 response = gemini_client.models.generate_content(
                     model=model_name,
                     contents=prompt,
@@ -181,8 +209,18 @@ def _call_ai_with_fallback(prompt: str) -> str:
                     logger.warning(f"{model_name} rate limited, trying next...")
                 else:
                     logger.warning(f"{model_name} failed: {error_str[:100]}, trying next...")
-    
-    # Fallback to Kimi/Moonshot
+
+    # 2. DeepSeek (Fallback)
+    if DEEPSEEK_API_KEY and deepseek_client:
+        try:
+            logger.info("Trying DeepSeek...")
+            result = _call_deepseek(prompt)
+            logger.info("DeepSeek succeeded")
+            return result
+        except Exception as e:
+            logger.warning(f"DeepSeek failed: {str(e)[:100]}, trying next...")
+
+    # 3. Kimi (Last resort)
     if KIMI_API_KEY and kimi_client:
         try:
             logger.info("Trying Kimi/Moonshot...")
@@ -190,8 +228,8 @@ def _call_ai_with_fallback(prompt: str) -> str:
             logger.info("Kimi succeeded")
             return result
         except Exception as e:
-            logger.warning(f"Kimi failed: {str(e)[:80]}")
-    
+            logger.warning(f"Kimi failed: {str(e)[:80]}, trying next...")
+
     raise RuntimeError("All AI providers failed. Check your API keys or wait for quota reset.")
 
 
@@ -199,7 +237,10 @@ def _call_ai_with_fallback(prompt: str) -> str:
 
 def structure_questions_with_ai(raw_text: str) -> list[dict]:
     """Send extracted text to AI to structure into questions JSON."""
-    prompt = PARSE_QUESTIONS_PROMPT.format(text=raw_text[:15000])
+    # Gemini (primary) handles 1M tokens — allow up to 50KB for better coverage
+    # DeepSeek/Kimi fallbacks have smaller context, but 50KB still fits comfortably
+    text_limit = 50000 if gemini_client else 15000
+    prompt = PARSE_QUESTIONS_PROMPT.format(text=raw_text[:text_limit])
     
     response_text = _call_ai_with_fallback(prompt)
     cleaned = _clean_json_response(response_text)
@@ -243,7 +284,8 @@ def structure_questions_with_ai(raw_text: str) -> list[dict]:
 
 def parse_answer_key_with_ai(raw_text: str) -> dict[str, str]:
     """Send answer key text to AI to extract question-answer mapping."""
-    prompt = PARSE_ANSWER_KEY_PROMPT.format(text=raw_text[:10000])
+    text_limit = 30000 if gemini_client else 10000
+    prompt = PARSE_ANSWER_KEY_PROMPT.format(text=raw_text[:text_limit])
     
     response_text = _call_ai_with_fallback(prompt)
     cleaned = _clean_json_response(response_text)

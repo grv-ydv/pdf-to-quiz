@@ -4,9 +4,9 @@ import { useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/contexts/AuthContext';
 import { supabase } from '@/lib/supabase';
-import { parsePdfUpload, parseAnswerKeyUpload } from '@/lib/api';
+import { parsePdfUploadStream, parseAnswerKeyUpload } from '@/lib/api';
 import { useDropzone } from 'react-dropzone';
-import { Upload, FileText, Key, Clock, ArrowLeft, ArrowRight, Check, X, Loader2 } from 'lucide-react';
+import { Upload, FileText, Key, Clock, ArrowLeft, ArrowRight, Check, X, Loader2, CheckCircle2 } from 'lucide-react';
 
 export default function NewQuizPage() {
     const { user } = useAuth();
@@ -24,6 +24,8 @@ export default function NewQuizPage() {
     const [step, setStep] = useState<'upload' | 'processing'>('upload');
     const [error, setError] = useState('');
     const [progress, setProgress] = useState('');
+    const [completedStages, setCompletedStages] = useState<string[]>([]);
+    const [currentStage, setCurrentStage] = useState('');
 
     // Question PDF dropzone
     const onDropQuestion = useCallback((accepted: File[]) => {
@@ -67,9 +69,11 @@ export default function NewQuizPage() {
 
         setStep('processing');
         setError('');
+        setCompletedStages([]);
+        setCurrentStage('uploading');
 
         try {
-            // 1. Upload Question Paper to Supabase Storage (for PDF viewer reference)
+            // 1. Upload Question Paper to Supabase Storage
             setProgress('Uploading question paper...');
             const questionPath = `pdfs/${user.id}/${Date.now()}_${questionFile.name}`;
             const { error: qUploadError } = await supabase.storage
@@ -86,7 +90,6 @@ export default function NewQuizPage() {
             // 2. Upload Answer Key to storage if provided
             let answerKeyUrl = '';
             if (answerKeyFile) {
-                setProgress('Uploading answer key...');
                 const keyPath = `pdfs/${user.id}/${Date.now()}_key_${answerKeyFile.name}`;
                 const { error: kUploadError } = await supabase.storage
                     .from('pdfs')
@@ -100,7 +103,10 @@ export default function NewQuizPage() {
                 }
             }
 
+            setCompletedStages(['uploading']);
+
             // 3. Create quiz record in Supabase
+            setCurrentStage('creating');
             setProgress('Creating quiz...');
             const title = questionFile.name.replace('.pdf', '').replace(/[_-]/g, ' ');
             const { data: quizData, error: quizError } = await supabase
@@ -119,20 +125,35 @@ export default function NewQuizPage() {
 
             if (quizError) throw new Error(`Quiz creation failed: ${quizError.message}`);
 
-            // 4. Parse PDF via direct file upload to backend (no URL download needed)
-            setProgress('Parsing questions with AI... This may take up to a minute.');
-            const parseResult = await parsePdfUpload(questionFile, quizData.id);
-            console.log('Parse result:', parseResult);
+            setCompletedStages(prev => [...prev, 'creating']);
+
+            // 4. Parse PDF with streaming progress
+            await parsePdfUploadStream(questionFile, quizData.id, (data) => {
+                setProgress(data.message);
+                setCurrentStage(data.stage);
+                if (data.stage === 'ai_processing') {
+                    setCompletedStages(prev =>
+                        prev.includes('extracting') ? prev : [...prev, 'extracting']
+                    );
+                }
+                if (data.stage === 'saving') {
+                    setCompletedStages(prev =>
+                        prev.includes('ai_processing') ? prev : [...prev, 'ai_processing']
+                    );
+                }
+                if (data.stage === 'complete') {
+                    setCompletedStages(prev => [...prev, 'saving']);
+                }
+            });
 
             // 5. Parse answer key if provided
             if (answerKeyFile) {
+                setCurrentStage('answer_key');
                 setProgress('Parsing answer key with AI...');
                 try {
-                    const keyResult = await parseAnswerKeyUpload(answerKeyFile, quizData.id);
-                    console.log('Answer key result:', keyResult);
+                    await parseAnswerKeyUpload(answerKeyFile, quizData.id);
                 } catch (keyErr: any) {
                     console.warn('Answer key parsing failed:', keyErr);
-                    // Don't block quiz creation, just log the warning
                 }
             }
 
@@ -147,12 +168,45 @@ export default function NewQuizPage() {
     }
 
     if (step === 'processing') {
+        const stages = [
+            { key: 'uploading', label: 'Uploading files' },
+            { key: 'creating', label: 'Creating quiz' },
+            { key: 'extracting', label: 'Extracting text from PDF' },
+            { key: 'ai_processing', label: 'Structuring questions with AI' },
+            { key: 'saving', label: 'Saving to database' },
+        ];
+
         return (
             <div className="page-center">
-                <div className="fade-in" style={{ textAlign: 'center', maxWidth: '400px' }}>
-                    <Loader2 size={40} color="var(--accent)" style={{ animation: 'spin 1s linear infinite', marginBottom: '20px' }} />
-                    <h2 style={{ fontSize: '20px', fontWeight: 600, marginBottom: '8px' }}>Setting up your quiz</h2>
-                    <p style={{ color: 'var(--text-muted)', fontSize: '14px' }}>{progress}</p>
+                <div className="fade-in" style={{ textAlign: 'center', maxWidth: '440px' }}>
+                    <Loader2 size={36} color="var(--accent)" style={{ animation: 'spin 1s linear infinite', marginBottom: '16px' }} />
+                    <h2 style={{ fontSize: '20px', fontWeight: 600, marginBottom: '20px' }}>Setting up your quiz</h2>
+
+                    <div style={{ textAlign: 'left', margin: '0 auto', maxWidth: '320px' }}>
+                        {stages.map(s => {
+                            const isDone = completedStages.includes(s.key);
+                            const isActive = currentStage === s.key && !isDone;
+                            return (
+                                <div key={s.key} style={{
+                                    display: 'flex', alignItems: 'center', gap: '10px',
+                                    padding: '6px 0', fontSize: '14px',
+                                    color: isDone ? 'var(--success)' : isActive ? 'var(--text-primary)' : 'var(--text-muted)',
+                                    fontWeight: isActive ? 600 : 400,
+                                }}>
+                                    {isDone ? (
+                                        <CheckCircle2 size={16} color="var(--success)" />
+                                    ) : isActive ? (
+                                        <Loader2 size={16} style={{ animation: 'spin 1s linear infinite' }} />
+                                    ) : (
+                                        <div style={{ width: 16, height: 16, borderRadius: '50%', border: '2px solid var(--border-light)' }} />
+                                    )}
+                                    {s.label}
+                                </div>
+                            );
+                        })}
+                    </div>
+
+                    <p style={{ color: 'var(--text-muted)', fontSize: '13px', marginTop: '16px' }}>{progress}</p>
                     {error && <p className="error-text" style={{ marginTop: '12px' }}>{error}</p>}
                     <style jsx>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
                 </div>
